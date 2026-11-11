@@ -91,6 +91,7 @@ tr.sel td{background:var(--accent-soft)}
 tbody tr:hover td{background:#faf9f5}
 tr.sel:hover td{background:var(--accent-soft)}
 .tblwrap{overflow-x:auto}
+details.acc>summary{cursor:pointer;font-weight:600;color:var(--accent)}
 .sgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px 14px}
 .sgrid label{display:flex;flex-direction:column;gap:3px}
 .search{display:flex;align-items:center;gap:4px;background:#fff;border:1px solid var(--line);border-radius:8px;padding:0 4px 0 10px;min-width:300px}
@@ -195,7 +196,8 @@ details.how li{margin-bottom:6px}
       <p>Match your bank statement against your cash book automatically, find unpresented cheques, outstanding lodgements and errors, and produce a finished reconciliation statement.</p>
     </div>
     <div class="row">
-      <button id="btnSample">Load sample data</button>
+      <select id="sampleSize" style="width:auto" title="Sample size"><option value="1">Random month (~250 lines)</option><option value="3">Random quarter (~700 lines)</option><option value="demo">Small demo (25 lines)</option></select>
+      <button id="btnSample">Generate sample data</button>
       <button class="ghost" id="btnReset">Clear</button>
     </div>
   </header>
@@ -270,6 +272,7 @@ details.how li{margin-bottom:6px}
     <div class="sechead"><h3>Bank statement &amp; cash book</h3><span class="sub">Both records side by side in standard format, with each line's match status</span></div>
     <div class="card"><div class="tabs" id="bookTabs"><button data-t="bank" class="on">Bank statement</button><button data-t="ledger">Cash book</button></div><div class="tblwrap" id="book"></div></div>
 
+    <div id="accuracy" style="display:none"></div>
     <div class="sechead"><h3>Suggested matches</h3><span class="sub">Possible errors and timing differences to review</span></div>
     <div id="sugg"></div>
 
@@ -483,6 +486,7 @@ async function readLegacy(buf){
   return wb.SheetNames.map(n=>({name:n,rows:XLSX.utils.sheet_to_json(wb.Sheets[n],{header:1,raw:true,defval:''}).map(r=>r.map(v=>v instanceof Date?fmtDateCell(Date.UTC(v.getFullYear(),v.getMonth(),v.getDate())):typeof v==='number'?fmtNum(v):String(v)))}));
 }
 async function readFile(side,file){
+  S.sampleKey=null;
   const sd=S.sides[side],ext=(file.name.split('.').pop()||'').toLowerCase();sd.view='table';
   try{
     if(ext==='xlsx'||ext==='xlsm')setBook(side,await readXlsx(await file.arrayBuffer()),file.name);
@@ -737,6 +741,7 @@ function render(){
   document.querySelectorAll('tr[data-row]').forEach(r=>r.onclick=e=>{if(e.target.tagName==='INPUT')return;const id=r.dataset.row;S.sel.has(id)?S.sel.delete(id):S.sel.add(id);render();});
   renderBar();
   renderBook();
+  renderAccuracy();
 
   renderMatched();
 }
@@ -972,6 +977,107 @@ $('#btnXlsx').onclick=()=>{
   saveFile(name,buildReport());
 };
 
+/* ---------- random sample generator + accuracy key ---------- */
+const GEN={
+  companies:['Kingfisher Catering Ltd','Harbourline Interiors Ltd','Fernhill Trading Ltd','Bramble & Oak Joinery','Northlight Media Ltd','Copperleaf Dental Practice','Riverside Plumbing Ltd','Bluebell Nurseries','Ashdown Logistics Ltd','Meadowbank Events Ltd'],
+  banks:['Northbank plc','Cardinal Bank plc','Westgate Bank','Albion Bank','Thames & Mercia Bank'],
+  customers:['Abbey Road Weddings','Beacon Business Park','Cedar Lodge Care','Dovetail Events','Eastfield College','Foxglove Hotel','Greenway Council','Highland Golf Club','Iris Corporate','Jubilee Sports Club','Kensal Law LLP','Linden Medical','Mayfair Galleries','Newbury Racecourse','Oakhurst School','Pemberton Estates','Queensway Theatre','Rowan Charity Trust','Sterling Legal','Thornton Builders','Vale Pharmacy','Wexford Motors'],
+  suppliers:[['Brakes','Stock purchases',5000,'BACS'],['Booker Wholesale','Stock purchases',5000,'CARD'],['Travis Perkins','Materials',5000,'BACS'],['Screwfix','Repairs & materials',7800,'CARD'],['Staples UK','Office supplies',7500,'CARD'],['Amazon Business','Office equipment',7500,'CARD'],['BT Business','Phone & broadband',7502,'DD'],['Octopus Energy','Electricity',7200,'DD'],['Aviva','Insurance',7104,'DD'],['Xero','Software subscription',7505,'DD'],['Shell','Fuel',7400,'CARD'],['Google Ads','Advertising',6201,'CARD'],['Biffa','Waste collection',7800,'BACS'],['Printwise Ltd','Printing',7500,'BACS'],['Jones Electrical','Subcontract labour',5100,'CHQ'],['Reid Carpentry','Subcontract labour',5100,'CHQ'],['Taylor & Sons','Consultancy',7600,'CHQ'],['Carter Refrigeration','Equipment repairs',7800,'CHQ']]
+};
+function generateSample(months){
+  const R=(a,b)=>a+Math.random()*(b-a),RI=(a,b)=>Math.floor(R(a,b+1)),pick=a=>a[Math.floor(Math.random()*a.length)],money=(a,b)=>Math.round(R(a,b)*100);
+  const y=2026,m0=months===3?pick([0,3,6]):RI(0,9),start=Date.UTC(y,m0,1),end=Date.UTC(y,m0+months,0);
+  const day=(mo,d)=>{const last=new Date(Date.UTC(y,m0+mo+1,0)).getUTCDate();return Date.UTC(y,m0+mo,Math.max(1,Math.min(d,last)));};
+  const shift=(t,n)=>Math.min(t+n*DAY,end);
+  const L=[],B=[],K={transpositions:[],timing:[],batches:[],unpresented:[],lodgements:[],bankOnly:[],stale:null};
+  let inv=RI(1000,8000),chq=RI(100100,400000);
+  const addL=(d,cs,det,nc,amt,o={})=>{const g=Math.abs(amt),net=o.novat?g:Math.round(g/1.2);const r={d,cs,det,nc,amt,net,vat:g-net,inv:o.inv||'',chq:o.chq||''};L.push(r);return r;};
+  const addB=(d,typ,desc,amt)=>{const r={d,typ,desc,amt};B.push(r);return r;};
+  const swap=c=>{const p=String(Math.floor(c/100)),pe=String(c%100).padStart(2,'0'),idx=[];for(let i=0;i<p.length-1;i++)if(p[i]!==p[i+1])idx.push(i);if(!idx.length)return null;const i=pick(idx),w=p.slice(0,i)+p[i+1]+p[i]+p.slice(i+2);return w[0]==='0'?null:+(w+pe);};
+  const supNon=GEN.suppliers.filter(s=>s[3]!=='CHQ'),supChq=GEN.suppliers.filter(s=>s[3]==='CHQ');
+  const rent=pick([1500,1850,2200,2650])*100;
+  for(let mo=0;mo<months;mo++){
+    const mn=new Date(day(mo,1)).toLocaleDateString('en-GB',{month:'short',timeZone:'UTC'}).toUpperCase();
+    addL(day(mo,1),'Landlord Properties','Rent '+mn,7100,-rent,{novat:1});addB(day(mo,1),'SO','LANDLORD PROPERTIES RENT',-rent);
+    [5,12,19,26].forEach((d,w)=>{const a=money(2800,4800);addL(day(mo,d),'Staff',`Wages ${mn} wk${w+1}`,7000,-a,{novat:1});addB(day(mo,d),'BACS',`PAYROLL ${mn} W${w+1}`,-a);});
+    const pa=money(1400,2800);addL(day(mo,17),'HMRC','PAYE/NIC',2210,-pa,{novat:1});addB(day(mo,20),'DD','HMRC NDDS PAYE',-pa);
+    for(let i=RI(42,55);i>0;i--){const d=day(mo,RI(1,28)),c=pick(GEN.customers),a=money(150,4200),n=inv++;
+      addL(d,c,'Invoice '+n,4000,a,{inv:n});addB(shift(d,pick([0,0,1,1,2])),'FPS',pick([`FPS ${c.toUpperCase()} INV${n}`,`FPS CREDIT ${c.toUpperCase()}`,`BGC ${c.toUpperCase()} ${n}`]),a);}
+    for(let i=RI(46,60);i>0;i--){const s=pick(GEN.suppliers),d=day(mo,RI(1,28)),a=money(15,2400);
+      if(s[3]==='CHQ'){const n=chq++;addL(d,s[0],s[1],s[2],-a,{chq:n});addB(shift(d,RI(2,8)),'CHQ','CHQ '+n,-a);}
+      else{addL(d,s[0],s[1],s[2],-a);addB(shift(d,pick([0,1,1,2])),s[3],s[3]==='CARD'?`CARD ${s[0].toUpperCase()} ${RI(1000,9999)}`:`${s[3]} ${s[0].toUpperCase()}`,-a);}}
+    for(let k=(mo===0?RI(1,2):RI(0,2));k>0;k--){let s,a,w;do{s=pick(supNon.filter(x=>x[3]!=='DD'));a=money(100,2400);w=swap(a);}while(!w);
+      const d=day(mo,RI(2,26));addL(d,s[0],s[1],s[2],-w);addB(d,s[3],`${s[3]} ${s[0].toUpperCase()}`,-a);K.transpositions.push({d,party:s[0],bank:-a,cb:-w});}
+    {const d=day(mo,RI(4,24)),cs=[...GEN.customers].sort(()=>Math.random()-.5).slice(0,RI(2,3));let t=0;
+      cs.forEach(c=>{const a=money(200,1600),n=inv++;t+=a;addL(d,c,`Invoice ${n} - cheque paid in`,4000,a,{inv:n});});
+      addB(shift(d,1),'CR',`COUNTER CREDIT ${RI(100,999)}`,t);K.batches.push({kind:`${cs.length} cheques paid in together`,amt:t});}
+    {const c=pick(GEN.customers),k=RI(4,9),d=day(mo,RI(10,24));let t=0;
+      for(let i=0;i<k;i++){const a=money(90,850),n=inv++;t+=a;addL(d-RI(0,8)*DAY,c,'Invoice '+n,4000,a,{inv:n});}
+      addB(shift(d,2),'FPS',`FPS ${c.toUpperCase()} REMITTANCE`,t);K.batches.push({kind:`${c} paid ${k} invoices at once`,amt:t});}
+    const fee=money(8,32);addB(day(mo,31),'FEE',`ACCOUNT FEE ${mn}`,-fee);K.bankOnly.push(-fee);
+    const it=money(1,15);addB(day(mo,31),'INT','CREDIT INTEREST',it);K.bankOnly.push(it);
+    if(Math.random()<.7){const cc=money(6,40);addB(day(mo,28),'FEE','CARD MACHINE CHARGES',-cc);K.bankOnly.push(-cc);}
+  }
+  {const s=pick(supNon.filter(x=>x[3]==='BACS')),k=RI(3,6);let t=0;const pd=Math.min(day(months-1,22),end);
+    for(let i=0;i<k;i++){const a=money(150,1300);t+=a;addL(pd-RI(2,25)*DAY,s[0],`${s[1]} inv ${RI(10000,99999)}`,s[2],-a);}
+    addB(pd,'BACS',`BACS ${s[0].toUpperCase()} STATEMENT`,-t);K.batches.push({kind:`${s[0]}: ${k} invoices in one payment`,amt:-t});}
+  {const c=pick(GEN.customers),a=money(120,700),d=day(0,RI(2,12)),lag=RI(9,14);addL(d,c,'Refund to customer',4000,-a,{novat:1});addB(shift(d,lag),'BACS',`REFUND ${c.toUpperCase()}`,-a);K.timing.push({party:c,amt:-a,lag});}
+  [['DD','DD ADOBE CREATIVE CLOUD',-1,12,90],['DD','DD ICO DATA PROTECTION',-1,40,40],['FPS','FPS HMRC VAT REPAYMENT',1,300,1500],['FEE','UNPAID ITEM FEE',-1,15,15],['DD','DD SAFESTORE UNIT 14',-1,60,180]]
+    .sort(()=>Math.random()-.5).slice(0,RI(1,3)).forEach(([typ,desc,sg,a,b])=>{const v=sg*money(a,b);addB(day(RI(0,months-1),RI(3,27)),typ,desc,v);K.bankOnly.push(v);});
+  if(months===3){const s=pick(supChq),n=chq++,a=money(300,1200);addL(day(0,RI(5,12)),s[0],s[1],s[2],-a,{chq:n});K.unpresented.push(-a);K.stale={party:s[0],chq:n,amt:-a};}
+  for(let i=RI(2,4);i>0;i--){const s=pick(supChq),n=chq++,a=money(120,2200);addL(end-RI(0,4)*DAY,s[0],s[1],s[2],-a,{chq:n});K.unpresented.push(-a);}
+  for(let i=RI(1,3);i>0;i--){const c=pick(GEN.customers),a=money(300,4500),n=inv++;addL(end,c,`Invoice ${n} - cheque paid in`,4000,a,{inv:n});K.lodgements.push(a);}
+  L.sort((a,b)=>a.d-b.d);B.sort((a,b)=>a.d-b.d);
+  const open=money(8000,45000),co=pick(GEN.companies),bank=pick(GEN.banks),acct=String(RI(10000000,99999999));
+  const f2=c=>(c/100).toFixed(2);let bal=open;
+  const bankRows=[[`${bank} – Business Account Statement`],[co],[`Account ${acct}`],[`Statement period ${fmtDateCell(start)} – ${fmtDateCell(end)}`],[],['Date','Type','Details','Paid out','Paid in','Balance'],
+    ...B.map(r=>{bal+=r.amt;return[fmtDateCell(r.d),r.typ,r.desc,r.amt<0?f2(-r.amt):'',r.amt>0?f2(r.amt):'',f2(bal)];})];
+  const prefix=co.replace(/[^A-Z]/g,'').slice(0,2)||'CB';let cb=open;
+  const cbRows=[['Date','Ref','Invoice No.','Cheque No.','Customer / Supplier','Description','Nominal Code','Net','VAT','Receipts','Payments'],
+    ...L.map((r,i)=>{cb+=r.amt;return[fmtDateCell(r.d),prefix+String(i+1).padStart(4,'0'),String(r.inv),String(r.chq),r.cs,r.det,String(r.nc),f2(r.net),f2(r.vat),r.amt>0?f2(r.amt):'',r.amt<0?f2(-r.amt):''];})];
+  const sum=a=>a.reduce((x,y)=>x+y,0);
+  K.trueBalance=bal+sum(K.lodgements)+sum(K.unpresented);
+  K.meta={company:co,account:`${bank} ${acct}`,period:fmtDateCell(end),months,open,bankLines:B.length,cbLines:L.length};
+  return{bankRows,cbRows,open,K};
+}
+function loadGenerated(months){
+  const g=generateSample(months);
+  ['bank','ledger'].forEach(x=>{S.sides[x].view='table';S.sides[x].book=null;S.sides[x].fileName='';});
+  ['open-bank','open-ledger','close-bank','close-ledger','mCompany','mAccount','mPeriod','mPrep','mPrepDate','mRev','mRevDate','mNotes'].forEach(id=>$('#'+id).value='');
+  loadRows('bank',g.bankRows);
+  $('#open-ledger').value=(g.open/100).toFixed(2);loadRows('ledger',g.cbRows);
+  $('#mCompany').value=g.K.meta.company;$('#mAccount').value=g.K.meta.account;$('#mPeriod').value=g.K.meta.period;
+  S.sampleKey=g.K;run();
+  toast(`New sample: ${g.K.meta.company} · ${g.K.meta.bankLines} bank and ${g.K.meta.cbLines} cash book lines`);
+}
+function renderAccuracy(){
+  const box=$('#accuracy'),K=S.sampleKey;if(!K){box.innerHTML='';box.style.display='none';return;}
+  box.style.display='block';
+  const sg=suggestions(),R=compute(),uB=S.B.filter(t=>!t.m),uL=S.L.filter(t=>!t.m);
+  const takeFrom=(arr)=>{const pool=[...arr];return amt=>{const i=pool.findIndex(t=>t.amt===amt);if(i<0)return false;pool.splice(i,1);return true;};};
+  const tr=K.transpositions.filter(p=>sg.some(s=>s.type==='Transposition error'&&s.b.amt===p.bank&&s.l.amt===p.cb)||S.matches.some(m=>m.adj&&m.bs.some(t=>t.amt===p.bank)&&m.ls.some(t=>t.amt===p.cb))).length;
+  const tm=K.timing.filter(p=>sg.some(s=>s.b.amt===p.amt&&s.l.amt===p.amt)||S.matches.some(m=>m.bs.some(t=>t.amt===p.amt)&&m.ls.some(t=>t.amt===p.amt))).length;
+  const bt=K.batches.filter(p=>S.matches.some(m=>m.rule.startsWith('Batched')&&m.bs.length===1&&m.bs[0].amt===p.amt)).length;
+  const fu=takeFrom(uL.filter(t=>t.amt<0)),up=K.unpresented.filter(a=>fu(a)).length;
+  const fl=takeFrom(uL.filter(t=>t.amt>0)),lo=K.lodgements.filter(a=>fl(a)).length;
+  const fb=takeFrom(uB),bo=K.bankOnly.filter(a=>fb(a)).length;
+  const row=(label,found,total,note)=>`<tr><td>${label}${note?`<div class="ref">${note}</div>`:''}</td><td class="num">${total}</td><td class="num">${found}</td><td>${found===total?'<span class="pill t">✓ Found</span>':'<span class="pill b">Missed '+(total-found)+'</span>'}</td></tr>`;
+  const all=tr===K.transpositions.length&&tm===K.timing.length&&bt===K.batches.length&&up===K.unpresented.length&&lo===K.lodgements.length&&bo===K.bankOnly.length;
+  const pend=sg.length,balOk=R.adjBank===K.trueBalance&&R.diff===0;
+  const wasOpen=!!(box.querySelector('details')&&box.querySelector('details').open);
+  const total=K.transpositions.length+K.timing.length+K.batches.length+K.unpresented.length+K.lodgements.length+K.bankOnly.length;
+  box.innerHTML=`<div class="sechead"><h3>Sample accuracy check</h3><span class="sub">This random sample has ${total} deliberately hidden items. Try to find them yourself first</span></div>
+   <div class="card"><details class="acc"${wasOpen?' open':''}><summary>Reveal answers: what was hidden, and did ClearRec find it?</summary><div class="tblwrap" style="margin-top:10px"><table><thead><tr><th>Planted in the data</th><th class="num">Hidden</th><th class="num">Found</th><th></th></tr></thead><tbody>
+    ${row('Transposition errors (digits swapped)',tr,K.transpositions.length,K.transpositions.map(p=>`${esc(p.party)}: bank ${fmt(p.bank)} vs cash book ${fmt(p.cb)}`).join(' · '))}
+    ${row('Late-clearing items (outside date window)',tm,K.timing.length,K.timing.map(p=>`${esc(p.party)} ${fmt(p.amt)}, ${p.lag} days late`).join(' · '))}
+    ${row('Batched & multi-invoice payments',bt,K.batches.length,K.batches.map(p=>esc(p.kind)).join(' · '))}
+    ${row('Unpresented cheques',up,K.unpresented.length,K.stale?`Includes an old cheque from early in the quarter (${esc(K.stale.party)}, chq ${K.stale.chq}). It should be chased up`:'')}
+    ${row('Outstanding lodgements',lo,K.lodgements.length)}
+    ${row('Bank-only items (fees, interest, DDs, refunds)',bo,K.bankOnly.length)}
+   </tbody></table></div>
+   <div class="verdict ${balOk?'ok':''}" style="${balOk?'':'background:var(--warn-soft);color:var(--warn)'}"><span>${balOk?(all?'✓ Every planted item found, and the reconciliation reaches the true balance.':'Reaches the true balance.'):pend?`True balance is ${fmt(K.trueBalance)}. Accept the ${pend} suggested match${pend>1?'es':''} above to reach it.`:`True balance is ${fmt(K.trueBalance)}. ClearRec currently shows ${fmt(R.adjBank)}.`}</span><span class="num">${fmt(K.trueBalance)}</span></div></details></div>`;
+}
+
 /* ---------- export ---------- */
 function copyText(text,label){
   const fallback=()=>{modal(`<h3>${label}</h3><p class="hint">Copying was blocked here. Select all and copy manually.</p><textarea id="cpy" readonly>${esc(text)}</textarea><div class="row" style="justify-content:flex-end;margin-top:10px"><button id="cc">Close</button></div>`);$('#cc').onclick=closeModal;const t=$('#cpy');t.focus();t.select();};
@@ -1001,7 +1107,7 @@ $('#btnCopyCsv').onclick=()=>{
 ['bank','ledger'].forEach(side=>{
   const sd=S.sides[side];sd.view='table';sd.roles=[];bindGrid(side);
   const ta=$('#txt-'+side);let h;
-  ta.addEventListener('input',()=>{clearTimeout(h);h=setTimeout(()=>{sd.book=null;sd.fileName='';loadSide(side,ta.value);changed(side);},300);});
+  ta.addEventListener('input',()=>{clearTimeout(h);h=setTimeout(()=>{S.sampleKey=null;sd.book=null;sd.fileName='';loadSide(side,ta.value);changed(side);},300);});
   document.querySelectorAll(`.srcTabs[data-side="${side}"]>button`).forEach(b=>b.onclick=()=>{sd.view=b.dataset.v;if(sd.view==='csv')ta.value=sd.headers.length?toCSV(sd):'';renderGrid(side);});
   const card=ta.closest('.card');
   card.addEventListener('dragover',e=>{e.preventDefault();card.classList.add('drag');});
@@ -1012,7 +1118,7 @@ $('#btnCopyCsv').onclick=()=>{
 });
 document.querySelectorAll('input[type=file]').forEach(inp=>inp.addEventListener('change',()=>{const f=inp.files[0];if(!f)return;readFile(inp.dataset.side,f);inp.value='';}));
 $('#btnRun').onclick=run;
-$('#btnReset').onclick=()=>{['bank','ledger'].forEach(s=>{$('#txt-'+s).value='';$('#open-'+s).value='';$('#close-'+s).value='';S.sides[s].view='table';S.sides[s].book=null;S.sides[s].fileName='';loadSide(s,'');});$('#results').style.display='none';$('#err').style.display='none';};
+$('#btnReset').onclick=()=>{S.sampleKey=null;['bank','ledger'].forEach(s=>{$('#txt-'+s).value='';$('#open-'+s).value='';$('#close-'+s).value='';S.sides[s].view='table';S.sides[s].book=null;S.sides[s].fileName='';loadSide(s,'');});$('#results').style.display='none';$('#err').style.display='none';};
 
 const SAMPLE_BANK=`Date,Description,Money Out,Money In
 01/10/2026,FPS CREDIT HARPER LTD INV1043,,2400.00
@@ -1041,11 +1147,12 @@ const SAMPLE_LEDGER=`Date,Reference,Details,Receipts,Payments
 27/10/2026,100234,Blake Cleaning Services,,180.00
 29/10/2026,100235,Office lease deposit,,600.00
 31/10/2026,LODG,Wright Partners - cheque lodged,1320.00,`;
-$('#btnSample').onclick=()=>{
-  $('#txt-bank').value=SAMPLE_BANK;$('#txt-ledger').value=SAMPLE_LEDGER;
+function loadDemo(){
+  S.sampleKey=null;$('#txt-bank').value=SAMPLE_BANK;$('#txt-ledger').value=SAMPLE_LEDGER;
   $('#open-bank').value='5000.00';$('#open-ledger').value='5000.00';$('#close-bank').value='';$('#close-ledger').value='';
 ['bank','ledger'].forEach(x=>{S.sides[x].view='table';S.sides[x].book=null;S.sides[x].fileName='';});loadSide('bank',SAMPLE_BANK);loadSide('ledger',SAMPLE_LEDGER);run();
-};
+}
+$('#btnSample').onclick=()=>{const v=$('#sampleSize').value;if(v==='demo')loadDemo();else loadGenerated(+v);};
 </script>
 </body>
 </html>
